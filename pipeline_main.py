@@ -38,14 +38,16 @@ from pathlib import Path   # cross-platform file path handling
 #   - Drive paths: used when running in Google Colab with Google Drive mounted
 #   - Local paths: used when running on a local Windows machine
 
-# --- Google Drive paths (Colab) ---
+# --- Google Drive paths (Colab legacy defaults; none of these are required) ---
 HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/input"
 HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/archive"
-#HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/clients.txt"
-#HARDCODED_COUNTRY_CODES_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT/addition/dhl_country_codes.txt"
+# Optional: only used when CLIENTS_FILE / --clients-file is unset and the file exists on Drive.
+HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/clients.txt"
+# Optional: only used when COUNTRY_CODES_FILE / --country-codes-file is unset and the file exists.
+HARDCODED_COUNTRY_CODES_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/dhl_country_codes.txt"
 HARDCODED_OUTPUT_DIR = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/output"
 
-# --- Local Windows paths (used when Drive is not available) ---
+# --- Local Windows fallbacks (used when Drive is not mounted). Files are optional. ---
 LOCAL_INPUT_FOLDER = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\input"
 LOCAL_ARCHIVE_FOLDER = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\archive"
 LOCAL_CLIENTS_FILE = r"C:\Users\avitkin\.cursor\projects_folders\RMT\ups-transformation\addition\clients.txt"
@@ -180,7 +182,7 @@ def parse_args():
     parser.add_argument(
         "--clients-file",
         default=None,
-        help="Clients file path (one client per line).",
+        help="Optional: clients file (one name per line). If omitted, uses addition/clients.txt when present.",
     )
     parser.add_argument(
         "--country-codes-file",
@@ -400,8 +402,6 @@ def run_pipeline(
     # -----------------------------------------------------------------------
     if clients_file is None:
         clients_file = os.environ.get("CLIENTS_FILE")
-    if clients_file is None:
-        clients_file = HARDCODED_CLIENTS_FILE
 
     if country_codes_file is None:
         country_codes_file = os.environ.get("COUNTRY_CODES_FILE")
@@ -417,7 +417,8 @@ def run_pipeline(
         if input_folder in (None, HARDCODED_INPUT_FOLDER):
             input_folder = LOCAL_INPUT_FOLDER
         if clients_file == HARDCODED_CLIENTS_FILE:
-            clients_file = LOCAL_CLIENTS_FILE
+            _local_cl = Path(LOCAL_CLIENTS_FILE)
+            clients_file = str(_local_cl) if _local_cl.is_file() else None
         if country_codes_file == HARDCODED_COUNTRY_CODES_FILE:
             _local_cc = Path(LOCAL_COUNTRY_CODES_FILE)
             country_codes_file = str(_local_cc) if _local_cc.is_file() else None
@@ -429,9 +430,30 @@ def run_pipeline(
         # Running in Colab with Drive mounted: use Drive paths where available,
         # fall back to local paths only for paths that don't exist on Drive
         input_folder = _use_drive_or_local(input_folder, LOCAL_INPUT_FOLDER, is_dir=True) if input_folder else input_folder
-        clients_file = _use_drive_or_local(clients_file, LOCAL_CLIENTS_FILE)
+        if clients_file:
+            clients_file = _use_drive_or_local(clients_file, LOCAL_CLIENTS_FILE)
+        else:
+            _dc_cl = Path(HARDCODED_CLIENTS_FILE)
+            _lc_cl = Path(LOCAL_CLIENTS_FILE)
+            _proj_cl = PROJECT_ROOT / "addition" / "clients.txt"
+            if _dc_cl.is_file():
+                clients_file = str(_dc_cl)
+            elif _lc_cl.is_file():
+                clients_file = str(_lc_cl)
+            elif _proj_cl.is_file():
+                clients_file = str(_proj_cl.resolve())
         if country_codes_file:
             country_codes_file = _use_drive_or_local(country_codes_file, LOCAL_COUNTRY_CODES_FILE)
+        else:
+            _dc_cc = Path(HARDCODED_COUNTRY_CODES_FILE)
+            _lc_cc = Path(LOCAL_COUNTRY_CODES_FILE)
+            _proj_cc = PROJECT_ROOT / "addition" / "dhl_country_codes.txt"
+            if _dc_cc.is_file():
+                country_codes_file = str(_dc_cc)
+            elif _lc_cc.is_file():
+                country_codes_file = str(_lc_cc)
+            elif _proj_cc.is_file():
+                country_codes_file = str(_proj_cc.resolve())
         output_dir = _use_drive_or_local(output_dir, LOCAL_OUTPUT_DIR, is_dir=True)
         if archive_folder:
             archive_folder = _use_drive_or_local(archive_folder, LOCAL_ARCHIVE_FOLDER, is_dir=True)
@@ -469,7 +491,7 @@ def run_pipeline(
     output_postal_txt_path = _unique_path(output_root, input_stem + "_Postal_Code_Zones", ".txt")
     extracted_json_path = processing_root / f"{input_stem}_extracted_data.json"
 
-    # Resolve the clients file path (use addition/clients.txt as the default)
+    # Resolve path passed to read_client_list (missing file → empty list; see main.read_client_list).
     default_clients = PROJECT_ROOT / "addition" / "clients.txt"
     clients_path = Path(clients_file) if clients_file else default_clients
 
@@ -479,7 +501,7 @@ def run_pipeline(
     print("=" * 70)
     print(f"[*] Project root: {PROJECT_ROOT}")
     print(f"[*] Input: {input_file}")
-    print(f"[*] Clients file: {clients_path}")
+    print(f"[*] Clients file: {clients_path}" + ("" if clients_path.is_file() else " (optional — not found, client list empty)"))
     if country_codes_file:
         print(f"[*] Country codes file: {country_codes_file}")
     print(f"[*] Output directory: {output_root}")

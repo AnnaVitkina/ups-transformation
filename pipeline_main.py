@@ -6,8 +6,8 @@ HOW THIS FILE FITS INTO THE BIGGER PICTURE
 This is the "master controller" script.  Running it kicks off the entire process
 from start to finish in one go:
 
-  1. You pick a raw Azure Document Intelligence JSON file (the PDF scan result).
-  2. The script extracts all pricing data from it (via main.py / extractor).
+  1. You pick a Rate Card workbook (.xlsb / .xlsx) or a JSON file produced by conversion-to-json.py.
+  2. The script loads structured pricing data via conversion-to-json.py (workbook_to_payload).
   3. It builds a formatted Excel workbook (``transformation_to_excel``, imported here as ``create_table``).
   4. It creates a CountryZoning summary TXT file (via country_region_txt_creation.py).
   5. It moves the processed input file to an archive folder so it doesn't get processed twice.
@@ -39,7 +39,7 @@ from pathlib import Path   # cross-platform file path handling
 #   - Local paths: used when running on a local Windows machine
 
 # --- Google Drive paths (Colab legacy defaults; none of these are required) ---
-HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/input"
+HARDCODED_INPUT_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/input json"
 HARDCODED_ARCHIVE_FOLDER = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/archive"
 # Optional: only used when CLIENTS_FILE / --clients-file is unset and the file exists on Drive.
 HARDCODED_CLIENTS_FILE = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/clients.txt"
@@ -90,7 +90,7 @@ def _use_drive_or_local(path_str, local_fallback, is_dir=False):
 
 def _detect_project_root():
     """
-    Find the root folder of the project (the folder that contains main.py and the create_table shim).
+    Find the root folder of the project (the folder that contains conversion-to-json.py and create_table).
 
     This is needed because the script can be run from different working directories
     (e.g. directly, via Colab exec(), or from a subfolder).  We try several candidate
@@ -123,7 +123,12 @@ def _detect_project_root():
             if child.is_dir():
                 candidates.append(child)
 
-    # Return the first candidate that contains both create_table.py and main.py
+    # Prefer repo layout: create_table shim + Rate Card converter (conversion-to-json.py).
+    for c in candidates:
+        has_ct = (c / "create_table.py").exists()
+        has_conv = (c / "conversion-to-json.py").exists()
+        if has_ct and has_conv:
+            return c.resolve()
     for c in candidates:
         if (c / "create_table.py").exists() and (c / "main.py").exists():
             return c.resolve()
@@ -132,17 +137,167 @@ def _detect_project_root():
 
 
 # Detect the project root once at import time and add it to Python's module search path.
-# This ensures that "import create_table" and "import main" work regardless of
-# where the script is launched from.
+# This ensures that "import create_table" works regardless of where the script is launched from.
 PROJECT_ROOT = _detect_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import the other modules in this project
+import importlib.util
+
 import transformation_to_excel as create_table   # builds the Excel workbook from extracted JSON
 import fill_service_types    # fills in missing service_type values in the extracted data
-import main as extractor     # extracts structured data from the Azure Document Intelligence JSON
 from country_region_txt_creation import create_country_region_txt   # creates the CountryZoning TXT file
+
+# Client list helper only (no extraction through main.py).
+from main import read_client_list
+
+PIPELINE_INPUT_DIR = PROJECT_ROOT / "input"
+_CONVERSION_JSON_MODULE = None
+
+
+def _conversion_json_module():
+    """Load conversion-to-json.py (hyphenated filename; not a regular package name)."""
+    global _CONVERSION_JSON_MODULE
+    if _CONVERSION_JSON_MODULE is not None:
+        return _CONVERSION_JSON_MODULE
+    path = PROJECT_ROOT / "conversion-to-json.py"
+    if not path.is_file():
+        raise FileNotFoundError(f"Expected Rate Card converter at: {path}")
+    spec = importlib.util.spec_from_file_location("conversion_json", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load spec for {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _CONVERSION_JSON_MODULE = mod
+    return mod
+
+
+def _detect_client_from_input_path(client_list: list[str], filepath: str) -> str:
+    """Match longest client name against the file path / name (same idea as main.detect_client filename step)."""
+    if not client_list:
+        return "Unknown"
+    from pathlib import Path as _Path
+
+    stem = _Path(filepath).name
+    for ext in (".json", ".pdf", ".xlsx", ".xls", ".xlsb", ".csv"):
+        if stem.lower().endswith(ext):
+            stem = stem[: -len(ext)]
+    stem_lower = stem.lower()
+    for name in sorted(client_list, key=len, reverse=True):
+        if name.lower() in stem_lower:
+            return name
+    import re as _re
+
+    _STOP = {"rc", "rate", "rates", "ratecard", "card", "dhl", "express", "pdf", "toolbox", "gri", "non", "legacy"}
+    words = _re.split(r"[\s_\-]+", stem)
+    client_words = []
+    for w in words:
+        if w.lower() in _STOP or not w:
+            break
+        if w.isdigit():
+            break
+        client_words.append(w)
+    if client_words:
+        return " ".join(client_words).strip()
+    return client_list[0]
+
+
+def load_extracted_payload_from_input(input_file: str, client_list: list[str]) -> tuple[dict, str]:
+    """
+    Build the same ``extracted_data``-shape dict that downstream (fill_service_types, Excel) expects.
+
+    - ``.xlsb`` / ``.xlsx``: ``conversion-to-json.workbook_to_payload``.
+    - ``.json``: must already be extracted_data (top-level ``MainCosts``); not raw Azure DI JSON.
+    """
+    p = Path(input_file)
+    if not p.is_file():
+        raise FileNotFoundError(f"Input not found: {input_file}")
+    suff = p.suffix.lower()
+    client_guess = _detect_client_from_input_path(client_list, str(p))
+
+    if suff in (".xlsb", ".xlsx"):
+        conv = _conversion_json_module()
+        # Let conversion-to-json derive metadata.client from the sheet (column A / Client:);
+        # filename-based client_guess is only a fallback on the returned tuple.
+        processed = conv.workbook_to_payload(
+            p,
+            client="Unknown",
+            carrier=None,
+            validity_date=None,
+            document_currency="",
+        )
+        meta_client = (processed.get("metadata") or {}).get("client") or client_guess
+        return processed, meta_client or "Unknown"
+
+    if suff == ".json":
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("JSON root must be an object")
+        if "analyzeResult" in data:
+            raise ValueError(
+                "This pipeline expects Rate Card Excel or JSON from conversion-to-json.py, "
+                "not raw Azure Document Intelligence JSON. Use: python conversion-to-json.py "
+                "--input path/to/card.xlsb --output processing/from_rate_card_excel.json"
+            )
+        if "MainCosts" not in data:
+            raise ValueError(
+                "JSON must contain top-level 'MainCosts' (run conversion-to-json.py on the workbook first)."
+            )
+        meta = data.setdefault("metadata", {})
+        if not meta.get("client"):
+            meta["client"] = client_guess or "Unknown"
+        if not meta.get("FileName"):
+            meta["FileName"] = p.name
+        return data, meta.get("client") or client_guess or "Unknown"
+
+    raise ValueError(f"Unsupported input type {suff!r}. Use .xlsb, .xlsx, or extracted .json.")
+
+
+def _save_extracted_json(data: dict, output_path: str) -> None:
+    """Write extracted_data-shaped dict to JSON (same options as main.save_output)."""
+    print(f"[*] Saving extracted data to: {output_path}")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    kb = os.path.getsize(output_path) / 1024
+    print(f"[OK] Saved ({kb:.2f} KB)")
+
+
+def choose_pipeline_input_interactive() -> str:
+    """Pick a Rate Card workbook or extracted JSON from ``input/`` (or default workbook from converter)."""
+    inp = PIPELINE_INPUT_DIR
+    files: list[Path] = []
+    if inp.is_dir():
+        for pat in ("*.json", "*.xlsb", "*.xlsx"):
+            files.extend(inp.glob(pat))
+        files = sorted({f.resolve(): f for f in files}.values(), key=lambda x: x.name.lower())
+    if not files:
+        conv = _conversion_json_module()
+        default_wb = conv.default_input_workbook(PROJECT_ROOT)
+        if default_wb is not None and default_wb.is_file():
+            print(f"[WARN] No candidates in {inp}; using default workbook: {default_wb}")
+            return str(default_wb)
+        raise FileNotFoundError(
+            f"No .json / .xlsb / .xlsx in {inp} and no default workbook found. "
+            "Add a Rate Card file or set --input-file."
+        )
+    print("Select input file to process:")
+    print()
+    for i, path in enumerate(files, 1):
+        size_mb = path.stat().st_size / (1024 * 1024)
+        print(f"  {i}. {path.name}  ({size_mb:.2f} MB)")
+    print()
+    while True:
+        choice = input(f"Enter number (1-{len(files)}): ").strip()
+        try:
+            n = int(choice)
+            if 1 <= n <= len(files):
+                return str(files[n - 1])
+        except ValueError:
+            pass
+        print("Invalid choice. Enter a number from the list.")
 
 
 def parse_args():
@@ -153,8 +308,8 @@ def parse_args():
     use hardcoded defaults or ask the user to choose a file interactively.
 
     Supported arguments:
-      --input-file        path to a specific JSON file to process
-      --input-folder      folder to list JSON files from (user picks one interactively)
+      --input-file        path to Rate Card .xlsb / .xlsx or extracted JSON (from conversion-to-json.py)
+      --input-folder      folder to list .json / .xlsb / .xlsx from (interactive pick)
       --archive-folder    where to move the processed input file after completion
       --clients-file      path to the clients.txt file (one client name per line)
       --country-codes-file path to the country code lookup file
@@ -162,22 +317,22 @@ def parse_args():
       --verbose           show full debug output from all sub-steps
     """
     parser = argparse.ArgumentParser(
-        description="Run end-to-end DHL extraction and output generation pipeline."
+        description="Run end-to-end Rate Card pipeline (conversion-to-json → Excel → TXT)."
     )
     parser.add_argument(
         "--input-file",
         default=None,
-        help="Input Azure DI JSON path (can be on Google Drive).",
+        help="Rate Card workbook (.xlsb/.xlsx) or extracted JSON path (can be on Google Drive).",
     )
     parser.add_argument(
         "--input-folder",
         default=None,
-        help="Folder containing JSON files. Script will list them and ask you to choose one.",
+        help="Folder containing .json / .xlsb / .xlsx. Script lists them and asks you to choose one.",
     )
     parser.add_argument(
         "--archive-folder",
         default=None,
-        help="Archive folder path for processed input JSON. Default: <input-folder>/archive",
+        help="Archive folder for the processed input file (.json / .xlsb / .xlsx). Default: <input-folder>/archive",
     )
     parser.add_argument(
         "--clients-file",
@@ -205,28 +360,24 @@ def parse_args():
     return args
 
 
-def _list_json_files(folder_path):
-    """
-    Return a sorted list of all .json files found in the given folder.
-    Raises FileNotFoundError if the folder doesn't exist or contains no JSON files.
-    """
+def _list_pipeline_input_files(folder_path):
+    """Return sorted .json / .xlsb / .xlsx (Rate Card or extracted JSON)."""
     folder = Path(folder_path)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Input folder not found: {folder}")
-    files = sorted(folder.glob("*.json"), key=lambda p: p.name.lower())
+    files: list[Path] = []
+    for pat in ("*.json", "*.xlsb", "*.xlsx"):
+        files.extend(folder.glob(pat))
+    files = sorted({f.resolve(): f for f in files}.values(), key=lambda p: p.name.lower())
     if not files:
-        raise FileNotFoundError(f"No .json files found in: {folder}")
+        raise FileNotFoundError(f"No .json / .xlsb / .xlsx in: {folder}")
     return files
 
 
-def _choose_json_from_folder(folder_path):
-    """
-    Show a numbered list of JSON files in the folder and ask the user to pick one.
-    Keeps asking until a valid number is entered.
-    Returns the Path object of the chosen file.
-    """
-    files = _list_json_files(folder_path)
-    print("Select input JSON file:")
+def _choose_input_from_folder(folder_path):
+    """Show numbered list of candidate inputs; return chosen Path."""
+    files = _list_pipeline_input_files(folder_path)
+    print("Select input file:")
     print()
     for i, p in enumerate(files, 1):
         size_mb = p.stat().st_size / (1024 * 1024)   # convert bytes to megabytes
@@ -245,44 +396,30 @@ def _choose_json_from_folder(folder_path):
 
 def resolve_input_file(input_arg, input_folder_arg=None):
     """
-    Determine which input JSON file to process.
-
-    Resolution order:
-      1. If --input-file was given on the command line, use it directly.
-         - If it's just a filename (no folder), look for it inside the input/ folder.
-      2. If --input-folder was given (or an env var INPUT_FOLDER is set), list the
-         JSON files in that folder and ask the user to pick one interactively.
-      3. If neither was given, fall back to the extractor's own interactive file picker.
-
-    Returns: (input_file_path_string, input_folder_path_string_or_None)
+    Resolve input: Rate Card ``.xlsb`` / ``.xlsx`` or extracted-data ``.json``
+    (from conversion-to-json.py). Bare filename is resolved under ``<project>/input/``.
     """
     if input_arg is None:
-        # No specific file given; determine the folder to list files from
         env_input_folder = os.environ.get("INPUT_FOLDER")
         folder = input_folder_arg or env_input_folder or HARDCODED_INPUT_FOLDER
         if folder:
-            # Resolve Drive vs local path, then show the interactive picker
             folder = _use_drive_or_local(folder, LOCAL_INPUT_FOLDER, is_dir=True)
-            selected = _choose_json_from_folder(folder)
+            selected = _choose_input_from_folder(folder)
             return str(selected), str(Path(folder))
-        # Check if INPUT_FILE env var is set as a direct path
         env_input = os.environ.get("INPUT_FILE")
         if env_input:
             return env_input, None
-        # Last resort: use the extractor module's own interactive picker
-        return extractor.choose_input_file_interactive(), None
+        return choose_pipeline_input_interactive(), None
 
-    # A specific file was given; resolve it to an absolute path if needed
     p = Path(input_arg)
     if not p.is_absolute() and len(p.parts) == 1:
-        # Just a filename like "myfile.json" -> look in the input/ folder
-        return str(extractor.INPUT_DIR / p), None
+        return str(PIPELINE_INPUT_DIR / p), None
     return str(p), None
 
 
 def _archive_processed_input(input_file, input_folder=None, archive_folder=None):
     """
-    Move the processed input JSON file to an archive folder so it won't be
+    Move the processed input file (workbook or JSON) to an archive folder so it will not be
     accidentally processed again in the future.
 
     Archive folder resolution order:
@@ -375,19 +512,19 @@ def run_pipeline(
     verbose=False,
 ):
     """
-    Execute the full end-to-end pipeline for one input JSON file.
+    Execute the full end-to-end pipeline for one Rate Card workbook or extracted JSON.
 
-    This function is the heart of the script.  It runs five sequential steps:
-      Step 1: Read the client list and load the input JSON file.
-      Step 2: Detect the client name, extract fields, transform data, save extracted JSON.
-      Step 3: Fill any missing service_type values in the extracted data.
+    Sequential steps:
+      Step 1: Read the client list (metadata hint).
+      Step 2: Load data via conversion-to-json.py (workbook_to_payload or pre-built JSON).
+      Step 3: Fill any missing service_type values.
       Step 4: Build the Excel workbook from the extracted data.
       Step 5: Build the CountryZoning TXT summary file from the Excel workbook.
 
-    After all steps complete, the input JSON file is moved to the archive folder.
+    After completion, the input file is moved to the archive folder.
 
     Parameters:
-      input_file          – path to the Azure Document Intelligence JSON to process
+      input_file          – path to .xlsb / .xlsx Rate Card or extracted-data .json
       clients_file        – path to clients.txt (one client name per line)
       country_codes_file  – optional path to the country code lookup file
       output_dir          – folder where Excel and TXT outputs will be saved
@@ -489,9 +626,9 @@ def run_pipeline(
     output_xlsx_path = _unique_path(output_root, input_stem, ".xlsx")
     output_txt_path = _unique_path(output_root, input_stem + "_CountryZoning_by_RateName", ".txt")
     output_postal_txt_path = _unique_path(output_root, input_stem + "_Postal_Code_Zones", ".txt")
-    extracted_json_path = processing_root / f"{input_stem}_extracted_data.json"
+    extracted_json_path = processing_root / "from_rate_card_excel.json"
 
-    # Resolve path passed to read_client_list (missing file → empty list; see main.read_client_list).
+    # Resolve path for read_client_list (missing file → empty list).
     default_clients = PROJECT_ROOT / "addition" / "clients.txt"
     clients_path = Path(clients_file) if clients_file else default_clients
 
@@ -579,42 +716,36 @@ def run_pipeline(
             raise
 
     # -----------------------------------------------------------------------
-    # Step 1: Read the client list and load the input JSON file.
-    # The client list tells us which company names to look for in the document.
+    # Step 1: Read client list (for metadata client hint on workbooks).
     # -----------------------------------------------------------------------
-    print("Step 1: Reading clients and input JSON...")
-    client_list = _run_quiet("Read client list", extractor.read_client_list, str(clients_path))
-    input_data = _run_quiet("Read input JSON", extractor.read_converted_json, input_file)
+    print("Step 1: Reading client list...")
+    client_list = _run_quiet("Read client list", read_client_list, str(clients_path))
     print(f"[OK] Client names loaded: {len(client_list)}")
     print()
 
     # -----------------------------------------------------------------------
-    # Step 2: Extract and transform the data from the Azure Document Intelligence JSON.
-    #   - detect_client_from_json: searches the document text for a known client name
-    #   - extract_fields: pulls the structured fields from analyzeResult.documents[0].fields
-    #   - transform_data: converts the raw fields into our clean output structure;
-    #     input_data is passed as raw_data so the carrier fallback can search the full text
-    #   - save_output: writes the extracted data to a JSON file in processing/
+    # Step 2: Load Rate Card workbook or extracted JSON (conversion-to-json.py).
     # -----------------------------------------------------------------------
-    print("Step 2: Extracting and transforming data...")
-    client_name = _run_quiet("Detect client", extractor.detect_client_from_json, input_data, client_list, input_file)
-    fields = _run_quiet("Extract fields", extractor.extract_fields, input_data)
-    processed_data = _run_quiet("Transform data", extractor.transform_data, fields, client_name, input_data)
+    print("Step 2: Loading data (conversion-to-json)...")
+    processed_data, client_name = _run_quiet(
+        "Load Rate Card / JSON",
+        load_extracted_payload_from_input,
+        input_file,
+        client_list,
+    )
 
-    # Record the original filename in the metadata so it appears in the Excel Metadata tab
     FileName = Path(input_file).name
     processed_data.setdefault("metadata", {})["FileName"] = FileName
 
-    _run_quiet("Save extracted JSON", extractor.save_output, processed_data, str(extracted_json_path))
+    _run_quiet("Save extracted JSON", _save_extracted_json, processed_data, str(extracted_json_path))
     stats = processed_data.get("statistics", {})
-    print(f"[OK] Client detected: {client_name}")
+    print(f"[OK] Client: {client_name}")
     print(
-        f"[OK] Extracted rows: MainCosts={stats.get('MainCosts_rows', 0)}, "
-        f"AddedRates={stats.get('AddedRates_rows', 0)}, "
-        f"CountryZoning={stats.get('CountryZoning_rows', 0)}"
+        f"[OK] Rows: MainCosts={stats.get('MainCosts_rows', 0)}, "
+        f"CountryZoning={stats.get('CountryZoning_rows', 0)}, "
+        f"AccessorialCosts2={stats.get('AccessorialCosts2_rows', 0)}"
     )
     print()
-
     # -----------------------------------------------------------------------
     # Step 3: Fill in any MainCosts sections that have a null service_type.
     # This can happen when the PDF layout doesn't repeat the service name on every page.
@@ -633,8 +764,29 @@ def run_pipeline(
     # -----------------------------------------------------------------------
     print("Step 4: Creating Excel workbook...")
     output_xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_quiet("Create Excel", create_table.save_to_excel, processed_data, str(output_xlsx_path))
+    excel_summary = _run_quiet(
+        "Create Excel", create_table.save_to_excel, processed_data, str(output_xlsx_path)
+    )
     print(f"[OK] Excel created: {output_xlsx_path}")
+    acc = (excel_summary or {}).get("accessorial")
+    if acc is not None:
+        n = acc.get("rows", 0)
+        ref = acc.get("reference_file")
+        if acc.get("sheet_written"):
+            if ref:
+                print(
+                    f"[OK] Accessorial Costs tab: {n} row(s); "
+                    f"Cost Type list from {ref}"
+                )
+            else:
+                print(
+                    f"[OK] Accessorial Costs tab: {n} row(s); "
+                    "no client-matching reference file (Cost Type may be empty)"
+                )
+        else:
+            print(
+                "[*] Accessorial builder: 0 rows (Accessorial Costs tab not added)"
+            )
     print()
 
     # -----------------------------------------------------------------------
@@ -656,6 +808,8 @@ def run_pipeline(
         "MainCosts",
         "CountryZoning",
         "AdditionalZoning",
+        "AccessorialCosts2",
+        "Accessorial Costs",
         "GoGreenPlusCost",
         "DemandSurcharge",
     ]

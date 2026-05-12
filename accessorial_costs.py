@@ -8,7 +8,9 @@ Used for PDF-style ``AdditionalCostsPart1`` / ``AdditionalCostsPart2`` and for
 Reference list (column ``Name`` in .xlsx / .csv):
   - Resolved from ``metadata.client``: any file in the search folders whose **stem**
     matches the client (substring or token-style match — see ``_client_matches_accessorial_ref_filename``).
-  - Search order: optional ``accessorial_folder``, then ``addition/Accessorial Costs``,
+  - Search order: optional ``accessorial_folder`` argument, then paths from the
+    ``UPS_ACCESSORIAL_FOLDER`` environment variable (``os.pathsep``-separated list),
+    then :data:`FALLBACK_ACCESSORIAL_FOLDER` if set, then ``addition/Accessorial Costs``,
     then ``addition/`` (next to this file).
 
 Public:
@@ -23,8 +25,15 @@ ACCESSORIAL_MATCH_MIN_SCORE = 0.35
 ACCESSORIAL_MATCH_MIN_MARGIN = 0.06
 
 import difflib
+import os
 import re
 from pathlib import Path
+
+# Optional: single folder to search first (after ``accessorial_folder``). Useful in Colab
+# when reference .xlsx/.csv are not next to this repo — set to your Drive path, e.g.:
+#   FALLBACK_ACCESSORIAL_FOLDER = "/content/drive/MyDrive/.../Accessorial Costs"
+# Prefer env ``UPS_ACCESSORIAL_FOLDER`` in notebooks so you do not edit the repo.
+FALLBACK_ACCESSORIAL_FOLDER: str = ""
 
 # Known currency codes (most popular) — used to detect and strip currency from Cost Price
 CURRENCY_CODES = frozenset({
@@ -104,6 +113,28 @@ def _normalize_client_for_accessorial_match(client: str) -> str:
     # Trailing " - 2020", " – 2020", " -2020" (common client + validity year labels)
     c = re.sub(r"\s*[-–]\s*\d{4}\s*$", "", c, flags=re.IGNORECASE).strip()
     return c
+
+
+def _extra_accessorial_search_dirs() -> list[Path]:
+    """Paths from env / module fallback, in order, de-duplicated."""
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        raw = (raw or "").strip()
+        if not raw:
+            return
+        p = Path(raw)
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+
+    env = os.environ.get("UPS_ACCESSORIAL_FOLDER") or ""
+    for part in env.split(os.pathsep):
+        _add(part)
+    _add(FALLBACK_ACCESSORIAL_FOLDER)
+    return out
 
 
 def _client_matches_accessorial_ref_filename(client: str, file_stem: str) -> bool:
@@ -387,8 +418,9 @@ def build_accessorial_costs_rows(
 
     Cost Type fuzzy match:
       - Loads approved names from a reference file (column ``Name``) chosen by ``metadata.client``:
-        first matching file in ``accessorial_folder``, then ``addition/Accessorial Costs/``,
-        then ``addition/`` (see ``_client_matches_accessorial_ref_filename``).
+        first matching file in ``accessorial_folder`` (if passed), then ``UPS_ACCESSORIAL_FOLDER`` /
+        :data:`FALLBACK_ACCESSORIAL_FOLDER`, then ``addition/Accessorial Costs/``, then ``addition/``
+        (see ``_client_matches_accessorial_ref_filename``).
 
     Returns: ``(list_of_rows, path_of_reference_file_used_or_None)``
     """
@@ -429,8 +461,9 @@ def build_accessorial_costs_rows(
     # Find the reference file for Cost Type fuzzy matching.
     # Search order:
     #   1. accessorial_folder (if set)
-    #   2. addition/Accessorial Costs/
-    #   3. addition/
+    #   2. UPS_ACCESSORIAL_FOLDER (env) and FALLBACK_ACCESSORIAL_FOLDER (module constant)
+    #   3. addition/Accessorial Costs/
+    #   4. addition/
     # Filename must match metadata.client (see _client_matches_accessorial_ref_filename).
     # -----------------------------------------------------------------------
     if cost_type_ref_path is None:
@@ -440,9 +473,11 @@ def build_accessorial_costs_rows(
         search_dirs: list[Path] = []
         if accessorial_folder:
             search_dirs.append(Path(accessorial_folder))
+        for d in _extra_accessorial_search_dirs():
+            if d not in search_dirs:
+                search_dirs.append(d)
         local_addition = Path(__file__).resolve().parent / 'addition'
         local_accessorial_costs = local_addition / 'Accessorial Costs'
-        colab_path = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition"
         for d in (local_accessorial_costs, local_addition):
             if d not in search_dirs:
                 search_dirs.append(d)

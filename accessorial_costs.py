@@ -32,8 +32,7 @@ from pathlib import Path
 # Optional: single folder to search (after ``accessorial_folder``). Team Colab default
 # below; override with ``UPS_ACCESSORIAL_FOLDER`` or clear to "" for local-only runs.
 FALLBACK_ACCESSORIAL_FOLDER: str = (
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/"
-    "AI Adoption RMT/RMT UPS/addition/Accessorial Costs"
+    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition/Accessorial Costs"
 )
 
 # Known currency codes (most popular) — used to detect and strip currency from Cost Price

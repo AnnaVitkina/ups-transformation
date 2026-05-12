@@ -1,7 +1,10 @@
 """
-Build a multi-tab Excel workbook from ``processing/extracted_data.json``.
+Build a multi-tab Excel workbook from ``processing/from_rate_card_excel.json``.
 
 Orchestrates: ``transform_main_costs``, ``transform_other_tabs``, ``excel_helpers``.
+Includes an ``AccessorialCosts2`` tab when the JSON array is non-empty, and an
+``Accessorial Costs`` tab (approved ``Cost Type`` mapping via ``accessorial_costs.py``)
+when any accessorial source rows exist.
 Run: ``python transformation_to_excel.py``
 """
 
@@ -21,7 +24,7 @@ from transform_other_tabs import (
     flatten_array_data,
     pivot_added_rates,
 )
-from excel_helpers import write_matrix_sheet, write_sheet
+from excel_helpers import write_accessorial_sheet, write_matrix_sheet, write_sheet
 
 
 def load_extracted_data(filepath):
@@ -68,7 +71,13 @@ def create_metadata_sheet(workbook, metadata):
 
 
 def save_to_excel(data, output_path):
-    """Write workbook to ``output_path``."""
+    """Write workbook to ``output_path``.
+
+    Returns a summary dict. When accessorial sources exist, includes
+    ``accessorial``: ``rows``, ``reference_file``, ``sheet_written`` (from
+    ``accessorial_costs.build_accessorial_costs_rows``) so callers can log
+    mapping status without relying on captured stdout.
+    """
     print(f"[*] Creating Excel file: {output_path}")
 
     try:
@@ -78,6 +87,7 @@ def save_to_excel(data, output_path):
         raise
 
     try:
+        excel_build_summary: dict = {}
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
 
@@ -151,6 +161,33 @@ def save_to_excel(data, output_path):
                 metadata,
             )
 
+        accessorial_costs_2 = data.get('AccessorialCosts2', [])
+        if accessorial_costs_2:
+            write_sheet(
+                wb, "AccessorialCosts2",
+                flatten_array_data(accessorial_costs_2, metadata, 'AccessorialCosts2'),
+                metadata,
+            )
+
+        ac_part1 = data.get('AdditionalCostsPart1') or []
+        ac_part2 = data.get('AdditionalCostsPart2') or []
+        if ac_part1 or ac_part2 or accessorial_costs_2:
+            from accessorial_costs import build_accessorial_costs_rows
+
+            ac_rows, ref_used = build_accessorial_costs_rows(
+                ac_part1,
+                ac_part2,
+                metadata,
+                accessorial_costs_2_toolbox=accessorial_costs_2 or None,
+            )
+            excel_build_summary["accessorial"] = {
+                "rows": len(ac_rows),
+                "reference_file": str(ref_used) if ref_used else None,
+                "sheet_written": bool(ac_rows),
+            }
+            if ac_rows:
+                write_accessorial_sheet(wb, "Accessorial Costs", ac_rows)
+
         demand_surcharge = data.get('DemandSurcharge') or []
         demand_costs = data.get('DemandCosts') or []
         if demand_surcharge or demand_costs:
@@ -188,6 +225,8 @@ def save_to_excel(data, output_path):
         print(f"  - Tabs: {len(wb.sheetnames)}")
         print(f"  - File size: {file_size_kb:.2f} KB")
 
+        return excel_build_summary
+
     except Exception as e:
         print(f"[ERROR] Failed to save Excel: {e}")
         raise
@@ -197,7 +236,7 @@ def main():
     print("=" * 60)
     print("RATE CARD → EXCEL")
     print("=" * 60)
-    input_file = 'processing/extracted_data.json'
+    input_file = 'processing/from_rate_card_excel.json'
     output_dir = 'output'
     output_file = os.path.join(output_dir, 'UPS_Rate_Cards.xlsx')
 

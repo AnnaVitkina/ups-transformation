@@ -70,8 +70,11 @@ def create_metadata_sheet(workbook, metadata):
     print("[OK] Metadata tab created")
 
 
-def save_to_excel(data, output_path):
+def save_to_excel(data, output_path, accessorial_folder=None):
     """Write workbook to ``output_path``.
+
+    ``accessorial_folder`` is passed to ``accessorial_costs.build_accessorial_costs_rows`` as the
+    first directory to search for client Cost Type reference files (optional).
 
     Returns a summary dict. When accessorial sources exist, includes
     ``accessorial``: ``rows``, ``reference_file``, ``sheet_written`` (from
@@ -178,6 +181,7 @@ def save_to_excel(data, output_path):
                 ac_part1,
                 ac_part2,
                 metadata,
+                accessorial_folder=accessorial_folder,
                 accessorial_costs_2_toolbox=accessorial_costs_2 or None,
             )
             excel_build_summary["accessorial"] = {

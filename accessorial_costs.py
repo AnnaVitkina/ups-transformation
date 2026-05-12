@@ -29,11 +29,12 @@ import os
 import re
 from pathlib import Path
 
-# Optional: single folder to search first (after ``accessorial_folder``). Useful in Colab
-# when reference .xlsx/.csv are not next to this repo — set to your Drive path, e.g.:
-#   FALLBACK_ACCESSORIAL_FOLDER = "/content/drive/MyDrive/.../Accessorial Costs"
-# Prefer env ``UPS_ACCESSORIAL_FOLDER`` in notebooks so you do not edit the repo.
-FALLBACK_ACCESSORIAL_FOLDER: str = ""
+# Optional: single folder to search (after ``accessorial_folder``). Team Colab default
+# below; override with ``UPS_ACCESSORIAL_FOLDER`` or clear to "" for local-only runs.
+FALLBACK_ACCESSORIAL_FOLDER: str = (
+    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/"
+    "AI Adoption RMT/RMT UPS/addition/Accessorial Costs"
+)
 
 # Known currency codes (most popular) — used to detect and strip currency from Cost Price
 CURRENCY_CODES = frozenset({

@@ -442,6 +442,7 @@ def build_accessorial_costs_rows(
             search_dirs.append(Path(accessorial_folder))
         local_addition = Path(__file__).resolve().parent / 'addition'
         local_accessorial_costs = local_addition / 'Accessorial Costs'
+        colab_path = "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT UPS/addition"
         for d in (local_accessorial_costs, local_addition):
             if d not in search_dirs:
                 search_dirs.append(d)

@@ -37,6 +37,39 @@ PACKAGE_ROW_COSTNAME_TOKENS = frozenset({
 })
 
 
+def _weight_looks_like_numeric_value(weight_str) -> bool:
+    """True when Weight is a row value (e.g. ``1.0``, ``25.0``), not a column header like ``kg``."""
+    if weight_str is None:
+        return False
+    s = str(weight_str).strip().replace(',', '.')
+    if not s:
+        return False
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_ups_main_costs_header_row(value_object, cost_name_raw) -> bool:
+    """
+    UPS toolbox tables use CostName ``Cntr`` / ``Pkg`` on both header and data rows.
+
+    Header row: Weight is the unit label (``kg``), zones hold market labels (``TB\\n4``).
+    Data rows: Weight is numeric; zones hold prices. Package tokens on a data row must not
+    start a new section.
+    """
+    if not cost_name_raw:
+        return False
+    cost_token = str(cost_name_raw).strip().lower()
+    if cost_token not in PACKAGE_ROW_COSTNAME_TOKENS:
+        return False
+    weight = extract_value(value_object.get('Weight'))
+    if weight is None:
+        return False
+    return not _weight_looks_like_numeric_value(weight)
+
+
 def read_converted_json(filepath):
     """
     Open and parse the Azure Document Intelligence JSON file from disk.
@@ -264,14 +297,15 @@ def process_main_costs(main_costs_field):
 
         # Decide whether this row is a header row or a data row.
         # DHL: header rows have RateName / CostName (e.g. surcharge name); data rows have only Weight + zones.
-        # UPS (ASSA): data rows repeat CostName as container codes (Pkg, Cntr, Pallet) — those must not
-        # start a new section; only CostName values outside that set behave like DHL headers.
+        # UPS: data rows repeat CostName as Pkg/Cntr; the table header row also has Cntr but Weight=kg.
         cost_name_raw = extract_value(value_object.get('CostName')) if 'CostName' in value_object else None
         cost_token = str(cost_name_raw).strip().lower() if cost_name_raw else ''
         is_package_costname = cost_token in PACKAGE_ROW_COSTNAME_TOKENS
 
         has_rate_name = bool(extract_value(value_object.get('RateName')))
-        has_cost_name_header = bool(cost_name_raw) and not is_package_costname
+        has_cost_name_header = bool(cost_name_raw) and (
+            not is_package_costname or _is_ups_main_costs_header_row(value_object, cost_name_raw)
+        )
 
         if has_rate_name or has_cost_name_header:
             # --- HEADER ROW: start a new rate card section ---
@@ -887,11 +921,26 @@ def detect_client_from_json(data, client_list, filename=None):
        "RC", "rate", "ratecard" (e.g. "DORM RC.pdf" -> "DORM").
     4. If the client list is empty, "Unknown" is returned.
     """
-    if not client_list:
-        print("[WARN] Client list is empty, using 'Unknown'")
-        return "Unknown"
-
     content = data.get('analyzeResult', {}).get('content', '')
+
+    if not client_list:
+        # UPS Spanish rate cards often label client after "Cliente" in raw content.
+        m = re.search(r'Cliente\s*\n\s*([^\n]+)', content or '', re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            if name:
+                print(f"[OK] Client detected from document (Cliente label): {name}")
+                return name
+        if filename:
+            stem = Path(filename).stem
+            for ext in ('.json', '.pdf', '.xlsx', '.xlsb', '.xls', '.csv'):
+                if stem.lower().endswith(ext):
+                    stem = stem[: -len(ext)]
+            if stem:
+                print(f"[OK] Client derived from filename (no clients.txt): {stem}")
+                return stem
+        print("[WARN] Client list is empty and could not detect client, using 'Unknown'")
+        return "Unknown"
 
     # --- Step 1: search the document text ---
     if content:

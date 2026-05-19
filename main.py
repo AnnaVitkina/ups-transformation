@@ -501,20 +501,70 @@ def detect_carrier_from_content(content):
 
     print("[WARN] Could not detect carrier from document text using DHL Express pattern")
 
-    # UPS rate cards: brand appears in the document and "Country:" labels the territory.
+    # UPS rate cards: brand in document; territory from Country: (EN) or Origen (ES) labels.
     if re.search(r'(?i)\bups\b', content or ''):
-        m = re.search(
+        for pattern in (
             r'(?im)^\s*Country:\s*([^\n]+)',
-            content or '',
-        )
-        if m:
-            country = m.group(1).strip()
-            if country:
-                carrier = f"UPS {country}"
-                print(f"[OK] Carrier detected from document text (UPS): {carrier!r}")
-                return carrier
+            r'(?im)^\s*Origen\s*\n\s*([^\n]+)',
+            r'(?im)^\s*Origen:\s*([^\n]+)',
+        ):
+            m = re.search(pattern, content or '')
+            if m:
+                country = m.group(1).strip()
+                if country:
+                    carrier = f"UPS {country}"
+                    print(f"[OK] Carrier detected from document text (UPS): {carrier!r}")
+                    return carrier
 
     return None
+
+
+def infer_ups_service_types_from_content(content, main_costs):
+    """
+    Fill null MainCosts service_type from document text when Azure omits RateName.
+
+    Spanish/compact UPS rate cards often expose ``Servicio`` / ``Origen`` in the OCR
+    text but leave RateName empty on toolbox table rows.
+    """
+    if not content or not main_costs:
+        return 0
+    if not re.search(r'(?i)\bups\b', content):
+        return 0
+
+    service_name = ''
+    m_svc = re.search(r'(?im)^\s*Servicio\s*\n\s*([^\n]+)', content)
+    if m_svc:
+        service_name = m_svc.group(1).strip()
+    if not service_name:
+        m_std = re.search(r'(?i)\b(UPS\s+Standard(?:\s+\w+)?)\b', content)
+        if m_std:
+            service_name = m_std.group(1).strip()
+
+    direction = ''
+    has_receiving = bool(re.search(r'(?i)\b(receiving|recibir|recepci[oó]n)\b', content))
+    has_sending = bool(re.search(r'(?i)\b(sending|enviar|para\s+enviar)\b', content))
+    if has_receiving and not has_sending:
+        direction = 'Receiving Rates'
+    elif has_sending and not has_receiving:
+        direction = 'Sending Rates'
+    elif has_sending:
+        direction = 'Sending Rates'
+
+    if service_name and direction:
+        label = f"{direction}\n{service_name}"
+    elif service_name:
+        label = service_name
+    elif direction:
+        label = direction
+    else:
+        return 0
+
+    filled = 0
+    for section in main_costs:
+        if not (section.get('service_type') or '').strip():
+            section['service_type'] = label
+            filled += 1
+    return filled
 
 
 def detect_validity_from_content(content):
@@ -760,6 +810,9 @@ def transform_data(fields, client_name, raw_data=None):
     main_costs = fields.get('MainCosts')
     if main_costs:
         output['MainCosts'] = process_main_costs(main_costs)
+        filled_svc = infer_ups_service_types_from_content(raw_content, output['MainCosts'])
+        if filled_svc:
+            print(f"[OK] Inferred service_type for {filled_svc} MainCosts section(s) from document text")
     else:
         print("[WARN] No MainCosts found in fields")
 

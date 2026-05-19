@@ -285,10 +285,24 @@ def global_country(metadata):
     return parts[-1].title() if parts else ''
 
 
+def _main_costs_has_ups_zone_headers(main_costs):
+    """True when zone headers use UPS toolbox market lines (TB/WW + zone number)."""
+    for rc in main_costs or []:
+        for zh in (rc.get('zone_headers') or {}).values():
+            s = str(zh or '').strip()
+            if not s:
+                continue
+            if re.match(r'(?i)^(TB|WW)\b', s) or '\n' in s and re.search(r'(?i)(TB|WW)', s):
+                return True
+    return False
+
+
 def _is_ups_maincosts_context(metadata, main_costs):
     """True when rate cards follow UPS ASSA-style movement + service labels."""
     c = (metadata.get('carrier') or '').lower()
     if 'ups' in c:
+        return True
+    if _main_costs_has_ups_zone_headers(main_costs):
         return True
     for rc in main_costs or []:
         st = (rc.get('service_type') or '').lower()
